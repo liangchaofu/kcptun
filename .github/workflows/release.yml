@@ -19,14 +19,14 @@ jobs:
         include:
           - goos: linux
             goarch: amd64
-          - goos: linux
-            goarch: arm64
-          - goos: linux
-            goarch: arm
-            goarm: 7
-          - goos: linux
-            goarch: arm
-            goarm: 6
+#          - goos: linux
+#            goarch: arm64
+#          - goos: linux
+#            goarch: arm
+#            goarm: 7
+#          - goos: linux
+#            goarch: arm
+#            goarm: 6
           - goos: linux
             goarch: 386
 
