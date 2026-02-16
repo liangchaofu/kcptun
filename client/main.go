@@ -1,25 +1,3 @@
-// The MIT License (MIT)
-//
-// # Copyright (c) 2016 xtaci
-//
-// Permission is hereby granted, free of charge, to any person obtaining a copy
-// of this software and associated documentation files (the "Software"), to deal
-// in the Software without restriction, including without limitation the rights
-// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-// copies of the Software, and to permit persons to whom the Software is
-// furnished to do so, subject to the following conditions:
-//
-// The above copyright notice and this permission notice shall be included in all
-// copies or substantial portions of the Software.
-//
-// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-// SOFTWARE.
-
 package main
 
 import (
@@ -27,21 +5,17 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math/big"
+	"math/rand"
 	"net"
-	"net/http"
-	_ "net/http/pprof"
 	"os"
 	"time"
 
 	"golang.org/x/crypto/pbkdf2"
 
-	"github.com/fatih/color"
 	"github.com/pkg/errors"
 	"github.com/urfave/cli"
 	kcp "github.com/xtaci/kcp-go/v5"
-	"github.com/xtaci/kcptun/std"
-	"github.com/xtaci/qpp"
+	"github.com/xtaci/kcptun/generic"
 	"github.com/xtaci/smux"
 )
 
@@ -50,14 +24,62 @@ const (
 	SALT = "kcp-go"
 	// maximum supported smux version
 	maxSmuxVer = 2
-	// scavenger check period
-	scavengePeriod = 5
+	// stream copy buffer size
+	bufSize = 4096
 )
 
 // VERSION is injected by buildflags
 var VERSION = "SELFBUILD"
 
+// handleClient aggregates connection p1 on mux with 'writeLock'
+func handleClient(session *smux.Session, p1 net.Conn, quiet bool) {
+	logln := func(v ...interface{}) {
+		if !quiet {
+			log.Println(v...)
+		}
+	}
+	defer p1.Close()
+	p2, err := session.OpenStream()
+	if err != nil {
+		logln(err)
+		return
+	}
+
+	defer p2.Close()
+
+	logln("stream opened", "in:", p1.RemoteAddr(), "out:", fmt.Sprint(p2.RemoteAddr(), "(", p2.ID(), ")"))
+	defer logln("stream closed", "in:", p1.RemoteAddr(), "out:", fmt.Sprint(p2.RemoteAddr(), "(", p2.ID(), ")"))
+
+	// start tunnel & wait for tunnel termination
+	streamCopy := func(dst io.Writer, src io.ReadCloser) {
+		if _, err := generic.Copy(dst, src); err != nil {
+			// report protocol error
+			if err == smux.ErrInvalidProtocol {
+				log.Println("smux", err, "in:", p1.RemoteAddr(), "out:", fmt.Sprint(p2.RemoteAddr(), "(", p2.ID(), ")"))
+			}
+		}
+		p1.Close()
+		p2.Close()
+	}
+
+	go streamCopy(p1, p2)
+	streamCopy(p2, p1)
+}
+
+func checkError(err error) {
+	if err != nil {
+		log.Printf("%+v\n", err)
+		os.Exit(-1)
+	}
+}
+
+type timedSession struct {
+	session    *smux.Session
+	expiryDate time.Time
+}
+
 func main() {
+	rand.Seed(int64(time.Now().Nanosecond()))
 	if VERSION == "SELFBUILD" {
 		// add more log flags for debugging
 		log.SetFlags(log.LstdFlags | log.Lshortfile)
@@ -87,21 +109,12 @@ func main() {
 		cli.StringFlag{
 			Name:  "crypt",
 			Value: "aes",
-			Usage: "aes, aes-128, aes-128-gcm, aes-192, salsa20, blowfish, twofish, cast5, 3des, tea, xtea, xor, sm4, none, null",
+			Usage: "aes, aes-128, aes-192, salsa20, blowfish, twofish, cast5, 3des, tea, xtea, xor, sm4, none, null",
 		},
 		cli.StringFlag{
 			Name:  "mode",
 			Value: "fast",
 			Usage: "profiles: fast3, fast2, fast, normal, manual",
-		},
-		cli.BoolFlag{
-			Name:  "QPP",
-			Usage: "enable Quantum Permutation Pads(QPP)",
-		},
-		cli.IntFlag{
-			Name:  "QPPCount",
-			Value: 61,
-			Usage: "the prime number of pads to use for QPP: The more pads you use, the more secure the encryption. Each pad requires 256 bytes.",
 		},
 		cli.IntFlag{
 			Name:  "conn",
@@ -122,11 +135,6 @@ func main() {
 			Name:  "mtu",
 			Value: 1350,
 			Usage: "set maximum transmission unit for UDP packets",
-		},
-		cli.IntFlag{
-			Name:  "ratelimit",
-			Value: 0,
-			Usage: "set maximum outgoing speed (in bytes per second) for a single KCP connection, 0 to disable. Also known as packet pacing",
 		},
 		cli.IntFlag{
 			Name:  "sndwnd",
@@ -156,25 +164,6 @@ func main() {
 		cli.BoolFlag{
 			Name:  "nocomp",
 			Usage: "disable compression",
-		},
-		cli.BoolFlag{
-			Name:  "zstd",
-			Usage: "use zstd compression instead of snappy",
-		},
-		cli.IntFlag{
-			Name:  "zstdwindow",
-			Value: 32,
-			Usage: "zstd window size in MB",
-		},
-		cli.IntFlag{
-			Name:  "zstdlevel",
-			Value: 4,
-			Usage: "zstd compression level: 1=fastest, 2=default, 3=better, 4=best",
-		},
-		cli.IntFlag{
-			Name:  "zstdconcurrency",
-			Value: 1,
-			Usage: "zstd encoder concurrency",
 		},
 		cli.BoolFlag{
 			Name:   "acknodelay",
@@ -208,18 +197,13 @@ func main() {
 		},
 		cli.IntFlag{
 			Name:  "smuxver",
-			Value: 2,
+			Value: 1,
 			Usage: "specify smux version, available 1,2",
 		},
 		cli.IntFlag{
 			Name:  "smuxbuf",
 			Value: 4194304,
 			Usage: "the overall de-mux buffer in bytes",
-		},
-		cli.IntFlag{
-			Name:  "framesize",
-			Value: 8192,
-			Usage: "smux max frame size",
 		},
 		cli.IntFlag{
 			Name:  "streambuf",
@@ -230,11 +214,6 @@ func main() {
 			Name:  "keepalive",
 			Value: 10, // nat keepalive interval in seconds
 			Usage: "seconds between heartbeats",
-		},
-		cli.IntFlag{
-			Name:  "closewait",
-			Value: 0,
-			Usage: "the seconds to wait before tearing down a connection",
 		},
 		cli.StringFlag{
 			Name:  "snmplog",
@@ -264,10 +243,6 @@ func main() {
 			Value: "", // when the value is not empty, the config path must exists
 			Usage: "config from json file, which will override the command from shell",
 		},
-		cli.BoolFlag{
-			Name:  "pprof",
-			Usage: "start profiling server on :6060",
-		},
 	}
 	myApp.Action = func(c *cli.Context) error {
 		config := Config{}
@@ -280,17 +255,12 @@ func main() {
 		config.AutoExpire = c.Int("autoexpire")
 		config.ScavengeTTL = c.Int("scavengettl")
 		config.MTU = c.Int("mtu")
-		config.RateLimit = c.Int("ratelimit")
 		config.SndWnd = c.Int("sndwnd")
 		config.RcvWnd = c.Int("rcvwnd")
 		config.DataShard = c.Int("datashard")
 		config.ParityShard = c.Int("parityshard")
 		config.DSCP = c.Int("dscp")
 		config.NoComp = c.Bool("nocomp")
-		config.Zstd = c.Bool("zstd")
-		config.ZstdWindow = c.Int("zstdwindow")
-		config.ZstdLevel = c.Int("zstdlevel")
-		config.ZstdConcurrency = c.Int("zstdconcurrency")
 		config.AckNodelay = c.Bool("acknodelay")
 		config.NoDelay = c.Int("nodelay")
 		config.Interval = c.Int("interval")
@@ -298,7 +268,6 @@ func main() {
 		config.NoCongestion = c.Int("nc")
 		config.SockBuf = c.Int("sockbuf")
 		config.SmuxBuf = c.Int("smuxbuf")
-		config.FrameSize = c.Int("framesize")
 		config.StreamBuf = c.Int("streambuf")
 		config.SmuxVer = c.Int("smuxver")
 		config.KeepAlive = c.Int("keepalive")
@@ -307,23 +276,10 @@ func main() {
 		config.SnmpPeriod = c.Int("snmpperiod")
 		config.Quiet = c.Bool("quiet")
 		config.TCP = c.Bool("tcp")
-		config.Pprof = c.Bool("pprof")
-		config.QPP = c.Bool("QPP")
-		config.QPPCount = c.Int("QPPCount")
-		config.CloseWait = c.Int("closewait")
 
 		if c.String("c") != "" {
 			err := parseJSONConfig(&config, c.String("c"))
 			checkError(err)
-		}
-
-		if config.Conn <= 0 {
-			log.Fatal("conn must be greater than 0")
-		}
-
-		if config.RateLimit < 0 {
-			log.Printf("ratelimit %d is negative, falling back to 0", config.RateLimit)
-			config.RateLimit = 0
 		}
 
 		// log redirect
@@ -366,26 +322,16 @@ func main() {
 		log.Println("smux version:", config.SmuxVer)
 		log.Println("listening on:", listener.Addr())
 		log.Println("encryption:", config.Crypt)
-		log.Println("QPP:", config.QPP)
-		log.Println("QPP Count:", config.QPPCount)
 		log.Println("nodelay parameters:", config.NoDelay, config.Interval, config.Resend, config.NoCongestion)
 		log.Println("remote address:", config.RemoteAddr)
 		log.Println("sndwnd:", config.SndWnd, "rcvwnd:", config.RcvWnd)
-		if config.NoComp {
-			log.Println("compression: disabled")
-		} else if config.Zstd {
-			log.Printf("compression: zstd (window: %dMB, level: %d, concurrency: %d)", config.ZstdWindow, config.ZstdLevel, config.ZstdConcurrency)
-		} else {
-			log.Println("compression: snappy")
-		}
+		log.Println("compression:", !config.NoComp)
 		log.Println("mtu:", config.MTU)
-		log.Println("ratelimit:", config.RateLimit)
 		log.Println("datashard:", config.DataShard, "parityshard:", config.ParityShard)
 		log.Println("acknodelay:", config.AckNodelay)
 		log.Println("dscp:", config.DSCP)
 		log.Println("sockbuf:", config.SockBuf)
 		log.Println("smuxbuf:", config.SmuxBuf)
-		log.Println("framesize:", config.FrameSize)
 		log.Println("streambuf:", config.StreamBuf)
 		log.Println("keepalive:", config.KeepAlive)
 		log.Println("conn:", config.Conn)
@@ -395,35 +341,8 @@ func main() {
 		log.Println("snmpperiod:", config.SnmpPeriod)
 		log.Println("quiet:", config.Quiet)
 		log.Println("tcp:", config.TCP)
-		log.Println("pprof:", config.Pprof)
 
-		// QPP parameters check
-		if config.QPP {
-			if config.QPPCount <= 0 {
-				log.Fatal("QPPCount must be greater than 0 when QPP is enabled")
-			}
-			minSeedLength := qpp.QPPMinimumSeedLength(8)
-			if len(config.Key) < minSeedLength {
-				color.Red("QPP Warning: 'key' has size of %d bytes, required %d bytes at least", len(config.Key), minSeedLength)
-			}
-
-			minPads := qpp.QPPMinimumPads(8)
-			if config.QPPCount < minPads {
-				color.Red("QPP Warning: QPPCount %d, required %d at least", config.QPPCount, minPads)
-			}
-
-			if new(big.Int).GCD(nil, nil, big.NewInt(int64(config.QPPCount)), big.NewInt(8)).Int64() != 1 {
-				color.Red("QPP Warning: QPPCount %d, choose a prime number for security", config.QPPCount)
-			}
-		}
-
-		// Scavenge parameters check
-		if config.AutoExpire != 0 && config.ScavengeTTL > config.AutoExpire {
-			color.Red("WARNING: scavengettl is bigger than autoexpire, connections may race hard to use bandwidth.")
-			color.Red("Try limiting scavengettl to a smaller value.")
-		}
-
-		// SMUX Version check
+		// parameters check
 		if config.SmuxVer > maxSmuxVer {
 			log.Fatal("unsupported smux version:", config.SmuxVer)
 		}
@@ -459,8 +378,6 @@ func main() {
 			block, _ = kcp.NewXTEABlockCrypt(pass[:16])
 		case "salsa20":
 			block, _ = kcp.NewSalsa20BlockCrypt(pass)
-		case "aes-128-gcm":
-			block, _ = kcp.NewAESGCMCrypt(pass[:16])
 		default:
 			config.Crypt = "aes"
 			block, _ = kcp.NewAESBlockCrypt(pass)
@@ -477,7 +394,6 @@ func main() {
 			kcpconn.SetWindowSize(config.SndWnd, config.RcvWnd)
 			kcpconn.SetMtu(config.MTU)
 			kcpconn.SetACKNoDelay(config.AckNodelay)
-			kcpconn.SetRateLimit(uint32(config.RateLimit))
 
 			if err := kcpconn.SetDSCP(config.DSCP); err != nil {
 				log.Println("SetDSCP:", err)
@@ -493,7 +409,6 @@ func main() {
 			smuxConfig.Version = config.SmuxVer
 			smuxConfig.MaxReceiveBuffer = config.SmuxBuf
 			smuxConfig.MaxStreamBuffer = config.StreamBuf
-			smuxConfig.MaxFrameSize = config.FrameSize
 			smuxConfig.KeepAliveInterval = time.Duration(config.KeepAlive) * time.Second
 
 			if err := smux.VerifyConfig(smuxConfig); err != nil {
@@ -504,14 +419,8 @@ func main() {
 			var session *smux.Session
 			if config.NoComp {
 				session, err = smux.Client(kcpconn, smuxConfig)
-			} else if config.Zstd {
-				zs, zerr := std.NewZstdStream(kcpconn, config.ZstdWindow<<20, config.ZstdLevel, config.ZstdConcurrency)
-				if zerr != nil {
-					return nil, errors.Wrap(zerr, "NewZstdStream()")
-				}
-				session, err = smux.Client(zs, smuxConfig)
 			} else {
-				session, err = smux.Client(std.NewCompStream(kcpconn), smuxConfig)
+				session, err = smux.Client(generic.NewCompStream(kcpconn), smuxConfig)
 			}
 			if err != nil {
 				return nil, errors.Wrap(err, "createConn()")
@@ -532,30 +441,16 @@ func main() {
 		}
 
 		// start snmp logger
-		go std.SnmpLogger(config.SnmpLog, config.SnmpPeriod)
+		go generic.SnmpLogger(config.SnmpLog, config.SnmpPeriod)
 
-		// start pprof
-		if config.Pprof {
-			go http.ListenAndServe(":6060", nil)
-		}
-
-		// start scavenger if autoexpire is set
+		// start scavenger
 		chScavenger := make(chan timedSession, 128)
-		if config.AutoExpire > 0 {
-			go scavenger(chScavenger, &config)
-		}
+		go scavenger(chScavenger, &config)
 
 		// start listener
 		numconn := uint16(config.Conn)
 		muxes := make([]timedSession, numconn)
 		rr := uint16(0)
-
-		// create shared QPP
-		var _Q_ *qpp.QuantumPermutationPad
-		if config.QPP {
-			_Q_ = qpp.NewQPP([]byte(config.Key), uint16(config.QPPCount))
-		}
-
 		for {
 			p1, err := listener.Accept()
 			if err != nil {
@@ -573,68 +468,21 @@ func main() {
 				}
 			}
 
-			go handleClient(_Q_, []byte(config.Key), muxes[idx].session, p1, config.Quiet, config.CloseWait)
+			go handleClient(muxes[idx].session, p1, config.Quiet)
 			rr++
 		}
 	}
 	myApp.Run(os.Args)
 }
 
-// handleClient aggregates connection p1 on mux
-func handleClient(_Q_ *qpp.QuantumPermutationPad, seed []byte, session *smux.Session, p1 net.Conn, quiet bool, closeWait int) {
-	logln := func(v ...any) {
-		if !quiet {
-			log.Println(v...)
-		}
-	}
-
-	// handles transport layer
-	defer p1.Close()
-	p2, err := session.OpenStream()
-	if err != nil {
-		logln(err)
+func scavenger(ch chan timedSession, config *Config) {
+	// When AutoExpire is set to 0 (default), sessionList will keep empty.
+	// Then this routine won't need to do anything; thus just terminate it.
+	if config.AutoExpire <= 0 {
 		return
 	}
-	defer p2.Close()
 
-	logln("stream opened", "in:", p1.RemoteAddr(), "out:", fmt.Sprint(p2.RemoteAddr(), "(", p2.ID(), ")"))
-	defer logln("stream closed", "in:", p1.RemoteAddr(), "out:", fmt.Sprint(p2.RemoteAddr(), "(", p2.ID(), ")"))
-
-	var s1, s2 io.ReadWriteCloser = p1, p2
-	// if QPP is enabled, create QPP read write closer
-	if _Q_ != nil {
-		// replace s2 with QPP port
-		s2 = std.NewQPPPort(p2, _Q_, seed)
-	}
-
-	// stream layer
-	err1, err2 := std.Pipe(s1, s2, closeWait)
-
-	// handles transport layer errors
-	if err1 != nil && err1 != io.EOF {
-		logln("pipe:", err1, "in:", p1.RemoteAddr(), "out:", fmt.Sprint(p2.RemoteAddr(), "(", p2.ID(), ")"))
-	}
-	if err2 != nil && err2 != io.EOF {
-		logln("pipe:", err2, "in:", p1.RemoteAddr(), "out:", fmt.Sprint(p2.RemoteAddr(), "(", p2.ID(), ")"))
-	}
-}
-
-func checkError(err error) {
-	if err != nil {
-		log.Printf("%+v\n", err)
-		os.Exit(-1)
-	}
-}
-
-// timedSession is a wrapper for smux.Session with expiry date
-type timedSession struct {
-	session    *smux.Session
-	expiryDate time.Time
-}
-
-// scavenger goroutine is used to close expired sessions
-func scavenger(ch chan timedSession, config *Config) {
-	ticker := time.NewTicker(scavengePeriod * time.Second)
+	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	var sessionList []timedSession
 	for {
@@ -644,6 +492,10 @@ func scavenger(ch chan timedSession, config *Config) {
 				item.session,
 				item.expiryDate.Add(time.Duration(config.ScavengeTTL) * time.Second)})
 		case <-ticker.C:
+			if len(sessionList) == 0 {
+				continue
+			}
+
 			var newList []timedSession
 			for k := range sessionList {
 				s := sessionList[k]
